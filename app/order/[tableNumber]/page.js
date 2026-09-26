@@ -1,7 +1,7 @@
 'use client'
 
 import { use, useState, useEffect } from 'react'
-import { supabase } from '@/lib/supabaseClient'
+import { supabase } from '../../../lib/supabaseClient'
 
 export default function OrderPage({ params }) {
   // Unwrap params ตามข้อกำหนด Next.js App Router เวอร์ชันล่าสุด
