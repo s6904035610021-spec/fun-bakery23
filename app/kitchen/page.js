@@ -4,526 +4,337 @@ import { useState, useEffect } from 'react'
 import { supabase } from '@/lib/supabaseClient'
 import Link from 'next/link'
 
-export default function GenerateQRPage() {
-  // ฟอร์ม Input
-  const [tableNumber, setTableNumber] = useState('')
-  const [adultCount, setAdultCount] = useState(1)
-  const [childCount, setChildCount] = useState(0)
-
-  // สถานะการทำงาน
-  const [loading, setLoading] = useState(false)
+export default function KitchenPage() {
+  const [orders, setOrders] = useState([])
+  const [loading, setLoading] = useState(true)
   const [errorMessage, setErrorMessage] = useState('')
 
-  // สถานะเมื่อเจอ Session ค้าง
-  const [existingSession, setExistingSession] = useState(null)
-  const [showConfirmModal, setShowConfirmModal] = useState(false)
+  // 1. ดึงข้อมูลออเดอร์เริ่มต้น ( status: 'received' หรือ 'cooking' )
+  const fetchOrders = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('orders')
+        .select('*')
+        .in('status', ['received', 'cooking'])
+        .order('created_at', { ascending: true }) // เรียงจากเก่าไปใหม่ (ออเดอร์เข้ามาก่อนอยู่ด้านหน้า)
 
-  // สถานะเมื่อเปิดโต๊ะใหม่สำเร็จ
-  const [createdSession, setCreatedSession] = useState(null)
-  const [originUrl, setOriginUrl] = useState('')
-  const [copied, setCopied] = useState(false)
+      if (error) throw error
+      setOrders(data || [])
+    } catch (err) {
+      console.error('Error fetching kitchen orders:', err)
+      setErrorMessage('ไม่สามารถโหลดรายการออเดอร์ได้')
+    } finally {
+      setLoading(false)
+    }
+  }
 
-  // ดึง Origin (Domain/Port) ปัจจุบันเมื่อโหลด client-side
   useEffect(() => {
-    if (typeof window !== 'undefined') {
-      setOriginUrl(window.location.origin)
+    fetchOrders()
+
+    // 2. ตั้งค่า Supabase Realtime Subscription ฟังการเปลี่ยนแปลงในตาราง orders
+    const channel = supabase
+      .channel('kitchen-orders-realtime')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'orders' },
+        (payload) => {
+          const { eventType, new: newRecord, old: oldRecord } = payload
+
+          if (eventType === 'INSERT') {
+            // ถ้ารับออเดอร์ใหม่เข้ามา
+            if (['received', 'cooking'].includes(newRecord.status)) {
+              setOrders((prevOrders) => {
+                // ป้องกันการใส่ข้อมูลซ้ำ
+                if (prevOrders.some((o) => o.id === newRecord.id)) return prevOrders
+                return [...prevOrders, newRecord]
+              })
+            }
+          } else if (eventType === 'UPDATE') {
+            // ถ้ามีการเปลี่ยน status
+            if (['received', 'cooking'].includes(newRecord.status)) {
+              // ถ้ายังอยู่ในสถานะที่ต้องทำ ให้ update ข้อมูลใน state
+              setOrders((prevOrders) =>
+                prevOrders.map((o) => (o.id === newRecord.id ? newRecord : o))
+              )
+            } else {
+              // ถ้าเปลี่ยน status เป็น 'served' หรืออื่น ๆ ให้ลบออกจากการ์ดหน้าจอทันที
+              setOrders((prevOrders) => prevOrders.filter((o) => o.id === newRecord.id ? false : true))
+            }
+          } else if (eventType === 'DELETE') {
+            setOrders((prevOrders) => prevOrders.filter((o) => o.id !== oldRecord.id))
+          }
+        }
+      )
+      .subscribe()
+
+    // ยกเลิก Subscription เมื่อ unmount
+    return () => {
+      supabase.removeChannel(channel)
     }
   }, [])
 
-  // คำนวณระยะเวลาเป็นนาทีจาก created_at
-  const getMinutesElapsed = (createdAt) => {
-    if (!createdAt) return 0
-    const created = new Date(createdAt)
-    const now = new Date()
-    const diffMs = now - created
-    return Math.floor(diffMs / (1000 * 60))
-  }
-
-  // 1. กดปุ่มเปิดโต๊ะ
-  const handleOpenTable = async (e) => {
-    e.preventDefault()
-    setErrorMessage('')
-    setExistingSession(null)
-    setCreatedSession(null)
-
-    const tableNum = parseInt(tableNumber, 10)
-    const adult = parseInt(adultCount, 10)
-    const child = parseInt(childCount, 10)
-
-    if (isNaN(tableNum) || tableNum <= 0) {
-      setErrorMessage('กรุณาระบุเลขโต๊ะให้ถูกต้อง')
-      return
-    }
-
-    setLoading(true)
-
+  // เปลี่ยนสถานะออเดอร์ ( 'cooking' หรือ 'served' )
+  const handleUpdateStatus = async (orderId, newStatus) => {
     try {
-      // 2. เช็คว่ามี session ที่ status = 'open' ของโต๊ะนี้อยู่แล้วหรือไม่
-      const { data: openSessions, error: checkError } = await supabase
-        .from('sessions')
-        .select('*')
-        .eq('table_number', tableNum)
-        .eq('status', 'open')
-
-      if (checkError) throw checkError
-
-      // ถ้ามี Session เปิดค้างอยู่
-      if (openSessions && openSessions.length > 0) {
-        setExistingSession(openSessions[0])
-        setLoading(false)
-        return
+      // Optimistic UI Update - ปรับการแสดงผลหน้าจอก่อนเพื่อความรวดเร็ว
+      if (newStatus === 'served') {
+        setOrders((prev) => prev.filter((o) => o.id !== orderId))
+      } else {
+        setOrders((prev) =>
+          prev.map((o) => (o.id === orderId ? { ...o, status: newStatus } : o))
+        )
       }
 
-      // ถ้าไม่มี ให้ Insert แถวใหม่ลงตาราง sessions
-      const { data: newSession, error: insertError } = await supabase
-        .from('sessions')
-        .insert([
-          {
-            table_number: tableNum,
-            adult_count: adult,
-            child_count: child,
-            status: 'open',
-          },
-        ])
-        .select()
-        .single()
+      const { error } = await supabase
+        .from('orders')
+        .update({ status: newStatus })
+        .eq('id', orderId)
 
-      if (insertError) throw insertError
-
-      // สร้างสำเร็จ
-      setCreatedSession(newSession)
+      if (error) {
+        throw error
+      }
     } catch (err) {
-      console.error(err)
-      setErrorMessage(err.message || 'เกิดข้อผิดพลาดในการเชื่อมต่อฐานข้อมูล')
-    } finally {
-      setLoading(false)
+      console.error('Error updating status:', err)
+      alert('ไม่สามารถอัปเดตสถานะได้ โปรดลองอีกครั้ง')
+      // ดึงข้อมูลใหม่หากเกิดข้อผิดพลาด
+      fetchOrders()
     }
   }
 
-  // 3. กดปิดโต๊ะเดิม
-  const handleCloseExistingSession = async () => {
-    if (!existingSession) return
-    setLoading(true)
-    setErrorMessage('')
-
-    try {
-      // update status = 'closed' เช็คเงื่อนไขป้องกันการกดซ้ำด้วย
-      const { error: updateError } = await supabase
-        .from('sessions')
-        .update({ status: 'closed' })
-        .eq('id', existingSession.id)
-        .eq('status', 'open')
-
-      if (updateError) throw updateError
-
-      // ปิดสำเร็จ -> ปิดกล่องยืนยัน, เอากล่องเตือนออก, พนักงานกดเปิดโต๊ะใหม่ได้เลย
-      setShowConfirmModal(false)
-      setExistingSession(null)
-      alert(`ปิด Session เดิมของโต๊ะ ${existingSession.table_number} เรียบร้อยแล้ว`)
-    } catch (err) {
-      console.error(err)
-      setErrorMessage('ไม่สามารถปิด Session เดิมได้ โปรดลองอีกครั้ง')
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  // 4. ล้างฟอร์มเพื่อเปิดโต๊ะใหม่
-  const handleResetForm = () => {
-    setTableNumber('')
-    setAdultCount(1)
-    setChildCount(0)
-    setCreatedSession(null)
-    setExistingSession(null)
-    setErrorMessage('')
-    setCopied(false)
-  }
-
-  // คัดลอกลิงก์
-  const targetUrl = createdSession
-    ? `${originUrl}/order/${createdSession.table_number}`
-    : ''
-
-  const handleCopyLink = () => {
-    if (!targetUrl) return
-    navigator.clipboard.writeText(targetUrl)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
+  // แปลงเวลา created_at เป็นรูปแบบอ่านง่าย (HH:mm น.)
+  const formatTime = (timeString) => {
+    if (!timeString) return ''
+    const date = new Date(timeString)
+    return date.toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' }) + ' น.'
   }
 
   return (
-    <div style={styles.container}>
-      {/* ส่วนหัว */}
+    <div style={styles.pageWrapper}>
+      {/* ส่วนหัวจอห้องครัว */}
       <header style={styles.header}>
-        <Link href="/" style={styles.backLink}>← กลับหน้าหลัก</Link>
-        <h1 style={styles.title}>เปิดโต๊ะ & สร้าง QR Code สั่งอาหาร</h1>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '20px' }}>
+          <Link href="/" style={styles.backLink}>← หน้าหลัก</Link>
+          <h1 style={styles.title}>👨‍🍳 จอแสดงรายการอาหาร (ห้องครัว)</h1>
+        </div>
+        <div style={styles.statusBadge}>
+          🟢 Realtime Active ({orders.length} ออเดอร์)
+        </div>
       </header>
 
-      {/* ข้อความแสดง Error ทั่วไป */}
-      {errorMessage && (
-        <div style={styles.errorBanner}>
-          ⚠️ {errorMessage}
-        </div>
-      )}
+      {errorMessage && <div style={styles.errorBox}>⚠️ {errorMessage}</div>}
 
-      {/* ----------------- กรณีที่ 1: แสดง QR Code เมื่อสร้างสำเร็จ ----------------- */}
-      {createdSession ? (
-        <div style={styles.qrCard}>
-          <div style={{ backgroundColor: '#dcfce7', color: '#15803d', padding: '10px 16px', borderRadius: '8px', fontWeight: 'bold', marginBottom: '20px' }}>
-            ✓ เปิดโต๊ะสำเร็จแล้ว
-          </div>
-
-          <p style={styles.summaryText}>
-            โต๊ะ {createdSession.table_number} · ผู้ใหญ่ {createdSession.adult_count} · เด็ก {createdSession.child_count}
-          </p>
-
-          <div style={styles.qrBox}>
-            <img
-              src={`https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(targetUrl)}`}
-              alt={`QR Code สำหรับโต๊ะ ${createdSession.table_number}`}
-              style={{ width: '260px', height: '260px', display: 'block', margin: '0 auto' }}
-            />
-          </div>
-
-          <div style={styles.urlBox}>
-            <span style={styles.urlText}>{targetUrl}</span>
-            <button type="button" onClick={handleCopyLink} style={styles.copyBtn}>
-              {copied ? 'คัดลอกแล้ว!' : 'คัดลอกลิงก์'}
-            </button>
-          </div>
-
-          <button type="button" onClick={handleResetForm} style={styles.resetBtn}>
-            + เปิดโต๊ะใหม่
-          </button>
+      {loading ? (
+        <div style={styles.loadingBox}>กำลังโหลดข้อมูลรายการอาหาร...</div>
+      ) : orders.length === 0 ? (
+        <div style={styles.emptyBox}>
+          <div style={{ fontSize: '4rem', marginBottom: '10px' }}>✨</div>
+          <p style={{ fontSize: '1.8rem', color: '#6b7280', margin: 0 }}>ไม่มีออเดอร์ค้างในขณะนี้</p>
         </div>
       ) : (
-        /* ----------------- กรณีที่ 2: ฟอร์มปกติ & กล่องเตือน Session ค้าง ----------------- */
-        <div style={styles.card}>
-          {/* กล่องเตือนภัยเมื่อมี Session เปิดค้างอยู่ */}
-          {existingSession && (
-            <div style={styles.warningBox}>
-              <h3 style={{ margin: '0 0 8px 0', fontSize: '1.2rem', color: '#991b1b' }}>
-                ⚠️ โต๊ะนี้มีลูกค้าอยู่ระหว่างทานอาหาร
-              </h3>
-              <p style={{ margin: '0 0 16px 0', fontSize: '1rem', color: '#7f1d1d' }}>
-                โต๊ะ {existingSession.table_number} มีการเปิด Session ค้างอยู่ กรุณาปิดออเดอร์เดิมก่อนเปิดใหม่
-              </p>
-              <button
-                type="button"
-                onClick={() => setShowConfirmModal(true)}
-                style={styles.closeOldBtn}
+        /* แสดงการ์ดออเดอร์แบบ Grid */
+        <div style={styles.gridContainer}>
+          {orders.map((order) => {
+            const isCooking = order.status === 'cooking'
+            return (
+              <div
+                key={order.id}
+                style={{
+                  ...styles.orderCard,
+                  backgroundColor: isCooking ? '#fffbe1' : '#ffffff',
+                  borderColor: isCooking ? '#f59e0b' : '#e5e7eb',
+                }}
               >
-                ปิดออเดอร์เดิม
-              </button>
-            </div>
-          )}
+                {/* Header การ์ด: เลขโต๊ะ + เวลา */}
+                <div
+                  style={{
+                    ...styles.cardHeader,
+                    backgroundColor: isCooking ? '#fef3c7' : '#f3f4f6',
+                  }}
+                >
+                  <span style={styles.tableBadge}>โต๊ะ {order.table_number}</span>
+                  <span style={styles.timeText}>⏰ {formatTime(order.created_at)}</span>
+                </div>
 
-          <form onSubmit={handleOpenTable} style={styles.form}>
-            <div style={styles.field}>
-              <label style={styles.label}>หมายเลขโต๊ะ:</label>
-              <input
-                type="number"
-                min="1"
-                required
-                placeholder="ระบุเลขโต๊ะ เช่น 7"
-                value={tableNumber}
-                onChange={(e) => setTableNumber(e.target.value)}
-                style={styles.input}
-              />
-            </div>
+                {/* รายการอาหาร */}
+                <div style={styles.itemsList}>
+                  {Array.isArray(order.items) &&
+                    order.items.map((item, idx) => (
+                      <div key={idx} style={styles.itemRow}>
+                        <span style={styles.itemName}>{item.name}</span>
+                        <span style={styles.itemQty}>x{item.quantity}</span>
+                      </div>
+                    ))}
+                </div>
 
-            <div style={styles.fieldRow}>
-              <div style={{ flex: 1 }}>
-                <label style={styles.label}>ผู้ใหญ่ (คน):</label>
-                <input
-                  type="number"
-                  min="1"
-                  required
-                  value={adultCount}
-                  onChange={(e) => setAdultCount(e.target.value)}
-                  style={styles.input}
-                />
+                {/* แถบสถานะ + ปุ่มกด */}
+                <div style={styles.cardFooter}>
+                  {order.status === 'received' ? (
+                    <button
+                      type="button"
+                      onClick={() => handleUpdateStatus(order.id, 'cooking')}
+                      style={styles.startBtn}
+                    >
+                      🔥 เริ่มทำ
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => handleUpdateStatus(order.id, 'served')}
+                      style={styles.servedBtn}
+                    >
+                      ✅ จัดเสิร์ฟแล้ว
+                    </button>
+                  )}
+                </div>
               </div>
-
-              <div style={{ flex: 1 }}>
-                <label style={styles.label}>เด็ก (คน):</label>
-                <input
-                  type="number"
-                  min="0"
-                  required
-                  value={childCount}
-                  onChange={(e) => setChildCount(e.target.value)}
-                  style={styles.input}
-                />
-              </div>
-            </div>
-
-            <button
-              type="submit"
-              disabled={loading}
-              style={{
-                ...styles.submitBtn,
-                opacity: loading ? 0.6 : 1,
-                cursor: loading ? 'not-allowed' : 'pointer'
-              }}
-            >
-              {loading ? 'กำลังประมวลผล...' : 'เปิดโต๊ะ'}
-            </button>
-          </form>
-        </div>
-      )}
-
-      {/* ----------------- Modal ยืนยันการปิดโต๊ะเดิม ----------------- */}
-      {showConfirmModal && existingSession && (
-        <div style={styles.modalOverlay}>
-          <div style={styles.modalContent}>
-            <h2 style={{ margin: '0 0 16px 0', color: '#b91c1c', fontSize: '1.4rem' }}>
-              ยืนยันการปิดโต๊ะเดิม
-            </h2>
-
-            <div style={styles.modalDetail}>
-              <p><strong>เลขโต๊ะ:</strong> โต๊ะ {existingSession.table_number}</p>
-              <p><strong>จำนวนลูกค้าเดิม:</strong> ผู้ใหญ่ {existingSession.adult_count} คน · เด็ก {existingSession.child_count} คน</p>
-              <p style={{ color: '#c2410c', fontWeight: 'bold' }}>
-                ⏱️ เปิดมาแล้ว {getMinutesElapsed(existingSession.created_at)} นาที
-              </p>
-            </div>
-
-            <p style={{ fontSize: '0.95rem', color: '#4b5563', marginBottom: '20px' }}>
-              คุณแน่ใจหรือไม่ว่าต้องการปิด Session เดิมของโต๊ะนี้?
-            </p>
-
-            <div style={styles.modalActions}>
-              <button
-                type="button"
-                onClick={() => setShowConfirmModal(false)}
-                disabled={loading}
-                style={styles.cancelBtn}
-              >
-                ยกเลิก
-              </button>
-              <button
-                type="button"
-                onClick={handleCloseExistingSession}
-                disabled={loading}
-                style={styles.confirmBtn}
-              >
-                {loading ? 'กำลังปิด...' : 'ยืนยันปิดโต๊ะเดิม'}
-              </button>
-            </div>
-          </div>
+            )
+          })}
         </div>
       )}
     </div>
   )
 }
 
-// Inline Styles ดีไซน์ตัวหนังสือใหญ่ เรียบง่าย เหมาะสำหรับงานหน้าร้าน
+// Inline Styles ออกแบบเน้นตัวหนังสือใหญ่ คอนทราสต์สูง อ่านง่ายในครัว
 const styles = {
-  container: {
-    maxWidth: '520px',
-    margin: '0 auto',
-    padding: '16px',
+  pageWrapper: {
+    minHeight: '100vh',
+    backgroundColor: '#111827',
+    color: '#ffffff',
+    padding: '24px',
     fontFamily: 'system-ui, -apple-system, sans-serif',
+    boxSizing: 'border-box',
   },
   header: {
-    marginBottom: '20px',
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: '24px',
+    paddingBottom: '16px',
+    borderBottom: '2px solid #374151',
   },
   backLink: {
-    color: '#2563eb',
+    color: '#9ca3af',
     textDecoration: 'none',
-    fontSize: '1rem',
+    fontSize: '1.2rem',
     fontWeight: 'bold',
   },
   title: {
-    fontSize: '1.6rem',
-    margin: '10px 0 0 0',
-    color: '#1f2937',
+    fontSize: '2rem',
+    margin: 0,
+    color: '#f9fafb',
   },
-  errorBanner: {
-    backgroundColor: '#fef2f2',
-    color: '#991b1b',
-    padding: '12px',
-    borderRadius: '8px',
-    marginBottom: '16px',
-    border: '1px solid #fecaca',
-    fontSize: '1rem',
+  statusBadge: {
+    backgroundColor: '#065f46',
+    color: '#a7f3d0',
+    padding: '8px 16px',
+    borderRadius: '20px',
+    fontSize: '1.1rem',
+    fontWeight: 'bold',
   },
-  card: {
-    backgroundColor: '#ffffff',
-    padding: '24px',
-    borderRadius: '16px',
-    boxShadow: '0 4px 12px rgba(0,0,0,0.08)',
-    border: '1px solid #e5e7eb',
-  },
-  warningBox: {
-    backgroundColor: '#fff7ed',
-    border: '2px solid #fdba74',
+  errorBox: {
+    backgroundColor: '#991b1b',
+    color: '#fecaca',
     padding: '16px',
-    borderRadius: '12px',
-    marginBottom: '24px',
+    borderRadius: '8px',
+    marginBottom: '20px',
+    fontSize: '1.2rem',
   },
-  closeOldBtn: {
+  loadingBox: {
+    textAlign: 'center',
+    fontSize: '1.8rem',
+    color: '#9ca3af',
+    marginTop: '80px',
+  },
+  emptyBox: {
+    textAlign: 'center',
+    padding: '100px 20px',
+    backgroundColor: '#1f2937',
+    borderRadius: '16px',
+    marginTop: '20px',
+  },
+  gridContainer: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))',
+    gap: '24px',
+    alignItems: 'start',
+  },
+  orderCard: {
+    borderRadius: '16px',
+    border: '4px solid',
+    overflow: 'hidden',
+    display: 'flex',
+    flexDirection: 'column',
+    boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.5)',
+  },
+  cardHeader: {
+    padding: '16px 20px',
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    borderBottom: '1px solid #e5e7eb',
+  },
+  tableBadge: {
+    fontSize: '2.2rem',
+    fontWeight: '900',
+    color: '#111827',
+  },
+  timeText: {
+    fontSize: '1.2rem',
+    fontWeight: 'bold',
+    color: '#4b5563',
+  },
+  itemsList: {
+    padding: '20px',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '12px',
+    flexGrow: 1,
+    minHeight: '120px',
+  },
+  itemRow: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    borderBottom: '1px dashed #d1d5db',
+    paddingBottom: '8px',
+  },
+  itemName: {
+    fontSize: '1.5rem',
+    fontWeight: 'bold',
+    color: '#111827',
+  },
+  itemQty: {
+    fontSize: '1.8rem',
+    fontWeight: '900',
+    color: '#dc2626',
+    backgroundColor: '#fef2f2',
+    padding: '2px 10px',
+    borderRadius: '8px',
+  },
+  cardFooter: {
+    padding: '16px 20px',
+    backgroundColor: 'rgba(0,0,0,0.03)',
+  },
+  startBtn: {
     width: '100%',
-    padding: '12px',
-    backgroundColor: '#dc2626',
+    padding: '16px',
+    backgroundColor: '#d97706',
     color: '#ffffff',
     border: 'none',
-    borderRadius: '8px',
-    fontSize: '1.05rem',
+    borderRadius: '12px',
+    fontSize: '1.4rem',
     fontWeight: 'bold',
     cursor: 'pointer',
   },
-  form: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '20px',
-  },
-  field: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '8px',
-  },
-  fieldRow: {
-    display: 'flex',
-    gap: '16px',
-  },
-  label: {
-    fontSize: '1.1rem',
-    fontWeight: 'bold',
-    color: '#374151',
-  },
-  input: {
+  servedBtn: {
     width: '100%',
-    padding: '14px',
-    fontSize: '1.2rem',
-    borderRadius: '8px',
-    border: '2px solid #d1d5db',
-    boxSizing: 'border-box',
-    outline: 'none',
-  },
-  submitBtn: {
     padding: '16px',
     backgroundColor: '#16a34a',
     color: '#ffffff',
     border: 'none',
-    borderRadius: '10px',
-    fontSize: '1.3rem',
-    fontWeight: 'bold',
-    marginTop: '10px',
-  },
-  qrCard: {
-    backgroundColor: '#ffffff',
-    padding: '24px',
-    borderRadius: '16px',
-    boxShadow: '0 4px 12px rgba(0,0,0,0.08)',
-    border: '1px solid #e5e7eb',
-    textAlign: 'center',
-  },
-  summaryText: {
-    fontSize: '1.4rem',
-    fontWeight: 'bold',
-    color: '#111827',
-    margin: '0 0 20px 0',
-  },
-  qrBox: {
-    backgroundColor: '#f9fafb',
-    padding: '16px',
     borderRadius: '12px',
-    border: '1px solid #e5e7eb',
-    marginBottom: '20px',
-  },
-  urlBox: {
-    display: 'flex',
-    flexDirection: 'column',
-    alignItems: 'center',
-    gap: '10px',
-    backgroundColor: '#f3f4f6',
-    padding: '12px',
-    borderRadius: '8px',
-    marginBottom: '24px',
-  },
-  urlText: {
-    fontSize: '1rem',
-    color: '#2563eb',
-    wordBreak: 'break-all',
-    fontWeight: '500',
-  },
-  copyBtn: {
-    padding: '8px 16px',
-    backgroundColor: '#3b82f6',
-    color: '#ffffff',
-    border: 'none',
-    borderRadius: '6px',
-    fontSize: '0.95rem',
-    fontWeight: 'bold',
-    cursor: 'pointer',
-  },
-  resetBtn: {
-    width: '100%',
-    padding: '14px',
-    backgroundColor: '#4b5563',
-    color: '#ffffff',
-    border: 'none',
-    borderRadius: '10px',
-    fontSize: '1.1rem',
-    fontWeight: 'bold',
-    cursor: 'pointer',
-  },
-  modalOverlay: {
-    position: 'fixed',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    backgroundColor: 'rgba(0,0,0,0.6)',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: '16px',
-    zIndex: 1000,
-  },
-  modalContent: {
-    backgroundColor: '#ffffff',
-    padding: '24px',
-    borderRadius: '16px',
-    maxWidth: '440px',
-    width: '100%',
-    boxShadow: '0 20px 25px -5px rgba(0,0,0,0.2)',
-  },
-  modalDetail: {
-    backgroundColor: '#fef2f2',
-    padding: '14px',
-    borderRadius: '8px',
-    marginBottom: '16px',
-    border: '1px solid #fecaca',
-    fontSize: '1.05rem',
-    lineHeight: '1.6',
-  },
-  modalActions: {
-    display: 'flex',
-    gap: '12px',
-    justifyContent: 'flex-end',
-  },
-  cancelBtn: {
-    flex: 1,
-    padding: '12px',
-    backgroundColor: '#e5e7eb',
-    color: '#374151',
-    border: 'none',
-    borderRadius: '8px',
-    fontSize: '1rem',
-    fontWeight: 'bold',
-    cursor: 'pointer',
-  },
-  confirmBtn: {
-    flex: 1,
-    padding: '12px',
-    backgroundColor: '#dc2626',
-    color: '#ffffff',
-    border: 'none',
-    borderRadius: '8px',
-    fontSize: '1rem',
+    fontSize: '1.4rem',
     fontWeight: 'bold',
     cursor: 'pointer',
   },
